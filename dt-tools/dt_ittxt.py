@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+#
+# t_ittxt._dt decompiler / compiler (item names + descriptions).
+# Part of the Trails From Zero Toolkit. Author: Edrahor.
 
 import sys
 import json
@@ -7,62 +10,121 @@ from pathlib import Path
 import argparse
 import struct
 
+# Console output may include non-ASCII text -- force stdout to UTF-8 so
+# prints don't crash on Windows cp1251.
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from byte_codec import (LETTER_TO_BYTE, BYTE_TO_LETTER, resolve_mode, add_mode_args,
+                        ENCODING_MODES, run_main, is_interactive)
+
 # Fixed encoding for the game
 GAME_ENCODING = 'shift-jis'
 ITEM_EXTENSION = '._dt'
 JSON_EXTENSION = '.json'
 
-def safe_decode_with_fallback(data_bytes):
-    """Safely decode bytes with fallback to escape sequences for problematic bytes"""
-    try:
-        return data_bytes.decode(GAME_ENCODING)
-    except UnicodeDecodeError:
-        result = ""
-        i = 0
-        while i < len(data_bytes):
-            decoded = False
-            # Try 2-byte sequence first (for shift-jis multibyte chars)
-            if i + 1 < len(data_bytes):
-                try:
-                    char = data_bytes[i:i+2].decode(GAME_ENCODING)
-                    result += char
-                    i += 2
-                    decoded = True
-                except UnicodeDecodeError:
-                    pass
-            # Try 1-byte sequence if 2-byte failed
-            if not decoded:
-                try:
-                    char = data_bytes[i:i+1].decode(GAME_ENCODING)
-                    result += char
-                    i += 1
-                    decoded = True
-                except UnicodeDecodeError:
-                    pass
-            # If both failed, escape the byte
-            if not decoded:
-                result += f"\\x{data_bytes[i]:02x}"
-                i += 1
-        return result
+def safe_decode_with_fallback(data_bytes, mode='halfwidth'):
+    """Safely decode bytes with fallback to escape sequences for problematic bytes.
 
-def safe_encode_with_fallback(text):
-    """Safely encode text back to bytes, handling escape sequences"""
+    Decoding order at each position:
+      1. (mode=halfwidth only) Single-byte letter code (BYTE_TO_LETTER) — wins
+         over the 2-byte SJIS interpretation, since 0xA1..0xDF are reserved
+         for the alphabet in our remapped font and 0x60/0x5E/0x5F (`/^/_)
+         are ASCII passthrough.
+      2. 2-byte SJIS pair (real Japanese / standard SJIS).
+      3. 1-byte SJIS / ASCII.
+      4. Hex escape `\\xNN` for raw bytes that decode none of the above.
+    """
+    result = ""
+    i = 0
+    n = len(data_bytes)
+    while i < n:
+        b = data_bytes[i]
+
+        # 1) Letter single-byte first (halfwidth mode only)
+        if mode == 'halfwidth':
+            letter = BYTE_TO_LETTER.get(b)
+            if letter is not None:
+                result += letter
+                i += 1
+                continue
+
+        decoded = False
+        # 2) 2-byte SJIS pair (only for proper SJIS lead bytes)
+        if (0x81 <= b <= 0x9F or 0xE0 <= b <= 0xFC) and i + 1 < n:
+            try:
+                char = data_bytes[i:i+2].decode(GAME_ENCODING)
+                result += char
+                i += 2
+                decoded = True
+            except UnicodeDecodeError:
+                pass
+
+        # 3) 1-byte fallback
+        if not decoded:
+            try:
+                char = data_bytes[i:i+1].decode(GAME_ENCODING)
+                result += char
+                i += 1
+                decoded = True
+            except UnicodeDecodeError:
+                pass
+
+        # 4) Raw byte escape
+        if not decoded:
+            result += f"\\x{data_bytes[i]:02x}"
+            i += 1
+    return result
+
+def safe_encode_with_fallback(text, use_letter_table=True, mode='halfwidth'):
+    """Safely encode text back to bytes, handling escape sequences.
+
+    Effective single-byte path = use_letter_table AND mode == 'halfwidth'.
+
+    Mode controls letter encoding for the WHOLE field (name AND
+    description). After the P1+P2 binary patches in zero.exe, both render
+    paths (direct font and SJIS->UTF-8 description path) accept halfwidth
+    bytes, so descriptions can also use 1-byte halfwidth in halfwidth mode.
+
+      halfwidth   : letters -> 1-byte halfwidth via LETTER_TO_BYTE.
+      passthrough : letters -> standard 2-byte SJIS pairs.
+
+    `use_letter_table` is kept as an explicit override (set False to force
+    2-byte SJIS even in halfwidth mode), but is no longer used anywhere by
+    the compiler itself.
+
+    Encoding order at each character:
+      1. Hex escape `\\xNN` -> raw byte NN (preserves control bytes verbatim).
+      2. Letter -> 1-byte (halfwidth mode) or 2-byte SJIS (otherwise).
+      3. Anything else -> standard SJIS encode (2 bytes for Japanese, 1 for ASCII).
+    """
+    use_halfwidth = use_letter_table and (mode == 'halfwidth')
     result = bytearray()
     i = 0
-    while i < len(text):
-        if i + 3 < len(text) and text[i:i+2] == "\\x":
-            try:
-                hex_str = text[i+2:i+4]
-                if len(hex_str) == 2 and all(c in '0123456789abcdefABCDEF' for c in hex_str):
-                    byte_val = int(hex_str, 16)
-                    result.append(byte_val)
-                    i += 4
-                    continue
-            except ValueError:
-                pass
+    n = len(text)
+    while i < n:
+        # 1) Hex escape
+        if i + 3 < n and text[i:i+2] == "\\x":
+            hex_str = text[i+2:i+4]
+            if len(hex_str) == 2 and all(c in '0123456789abcdefABCDEF' for c in hex_str):
+                result.append(int(hex_str, 16))
+                i += 4
+                continue
+
+        # 2) Letter -> single byte (halfwidth mode only)
+        if use_halfwidth:
+            b = LETTER_TO_BYTE.get(text[i])
+            if b is not None:
+                result.append(b)
+                i += 1
+                continue
+
+        # 3) Standard SJIS
         try:
-            encoded = text[i].encode(GAME_ENCODING)
-            result.extend(encoded)
+            result.extend(text[i].encode(GAME_ENCODING))
         except UnicodeEncodeError:
             result.append(ord('?'))
         i += 1
@@ -189,7 +251,7 @@ def analyze_file_structure(file_data):
         'file_size': len(file_data)
     }
 
-def extract_item_entry(data, start_pos):
+def extract_item_entry(data, start_pos, mode='halfwidth'):
     """Extract single item entry from data"""
     if start_pos + 8 > len(data):
         return None, start_pos
@@ -205,13 +267,13 @@ def extract_item_entry(data, start_pos):
     name_end = data.find(b'\x00', name_offset)
     if name_end == -1:
         name_end = len(data)
-    item_name = safe_decode_with_fallback(data[name_offset:name_end])
+    item_name = safe_decode_with_fallback(data[name_offset:name_end], mode=mode)
 
     # Extract description
     desc_end = data.find(b'\x00', desc_offset)
     if desc_end == -1:
         desc_end = len(data)
-    item_desc = safe_decode_with_fallback(data[desc_offset:desc_end])
+    item_desc = safe_decode_with_fallback(data[desc_offset:desc_end], mode=mode)
 
     # Find next entry start
     next_pos = desc_end + 1
@@ -240,16 +302,16 @@ def extract_item_entry(data, start_pos):
         'position': start_pos
     }, next_pos
 
-def extract_all_items(file_data, data_start):
+def extract_all_items(file_data, data_start, mode='halfwidth'):
     """Extract all item entries from file"""
-    print(f"Extracting items starting from 0x{data_start:x} using {GAME_ENCODING} encoding...")
+    print(f"Extracting items starting from 0x{data_start:x} using {GAME_ENCODING} encoding (mode={mode})...")
 
     items = []
     current_pos = data_start
     item_count = 0
 
     while current_pos < len(file_data):
-        item, next_pos = extract_item_entry(file_data, current_pos)
+        item, next_pos = extract_item_entry(file_data, current_pos, mode=mode)
 
         if item is None:
             print(f"Failed to extract item at position 0x{current_pos:x}")
@@ -306,7 +368,7 @@ def analyze_metadata_sections(original_data, structure_info, items):
 
     return pointer_sections
 
-def build_json_structure(item_path, original_data, structure_info, items):
+def build_json_structure(item_path, original_data, structure_info, items, mode='halfwidth'):
     """Build simplified JSON structure"""
     # Analyze metadata sections
     pointer_sections = analyze_metadata_sections(original_data, structure_info, items)
@@ -315,7 +377,7 @@ def build_json_structure(item_path, original_data, structure_info, items):
         "file_info": {
             "filename": item_path.name,
             "size": len(original_data),
-            "encoding": GAME_ENCODING
+            "encoding": GAME_ENCODING,
         },
         "structure": structure_info,
         "metadata_sections": pointer_sections,
@@ -325,8 +387,8 @@ def build_json_structure(item_path, original_data, structure_info, items):
 
     # Save original item sizes for change detection
     for item in items:
-        name_bytes = safe_encode_with_fallback(item['name']) + b'\x00'
-        desc_bytes = safe_encode_with_fallback(item['description']) + b'\x00'
+        name_bytes = safe_encode_with_fallback(item['name'], mode=mode) + b'\x00'
+        desc_bytes = safe_encode_with_fallback(item['description'], mode=mode) + b'\x00'
         result["original_item_sizes"][str(item['id'])] = {
             "name_size": len(name_bytes),
             "desc_size": len(desc_bytes),
@@ -344,7 +406,7 @@ def build_json_structure(item_path, original_data, structure_info, items):
 
     return result
 
-def update_metadata_pointers(original_data, structure_info, metadata_sections, items, original_sizes):
+def update_metadata_pointers(original_data, structure_info, metadata_sections, items, original_sizes, mode='halfwidth'):
     """Update item pointers in metadata when item sizes change"""
     print("Updating item pointers in metadata...")
 
@@ -363,8 +425,8 @@ def update_metadata_pointers(original_data, structure_info, metadata_sections, i
         item_id = str(item['id'])
 
         # Calculate new sizes
-        name_bytes = safe_encode_with_fallback(item['name']) + b'\x00'
-        desc_bytes = safe_encode_with_fallback(item['description']) + b'\x00'
+        name_bytes = safe_encode_with_fallback(item['name'], mode=mode) + b'\x00'
+        desc_bytes = safe_encode_with_fallback(item['description'], mode=mode) + b'\x00'
         new_total_size = 8 + len(name_bytes) + len(desc_bytes)
 
         new_positions[item['id']] = current_pos
@@ -462,7 +524,7 @@ def update_metadata_pointers(original_data, structure_info, metadata_sections, i
 
     return updated_metadata
 
-def build_items_data(items, data_start):
+def build_items_data(items, data_start, mode='halfwidth'):
     """Build item entries binary data"""
     print(f"Building items data starting at 0x{data_start:x}")
 
@@ -473,8 +535,8 @@ def build_items_data(items, data_start):
     current_pos = data_start
 
     for item in sorted_items:
-        name_bytes = safe_encode_with_fallback(item['name']) + b'\x00'
-        desc_bytes = safe_encode_with_fallback(item['description']) + b'\x00'
+        name_bytes = safe_encode_with_fallback(item['name'], mode=mode) + b'\x00'
+        desc_bytes = safe_encode_with_fallback(item['description'], mode=mode) + b'\x00'
 
         header_pos = current_pos
         name_pos = current_pos + 8
@@ -511,9 +573,10 @@ def build_items_data(items, data_start):
     print(f"Built {len(encoded_items)} items, total size: {len(items_data)} bytes")
     return items_data
 
-def decompile_item_db(item_path, json_path, test_compilation=False):
+def decompile_item_db(item_path, json_path, test_compilation=False, mode='halfwidth'):
     """Decompile item database file to JSON"""
     print(f"=== DECOMPILING {item_path} ===")
+    print(f"Encoding mode: {mode}")
 
     with open(item_path, 'rb') as f:
         original_data = f.read()
@@ -522,27 +585,29 @@ def decompile_item_db(item_path, json_path, test_compilation=False):
     print(f"Using encoding: {GAME_ENCODING}")
 
     structure_info = analyze_file_structure(original_data)
-    items = extract_all_items(original_data, structure_info['data_start'])
-    result = build_json_structure(item_path, original_data, structure_info, items)
+    items = extract_all_items(original_data, structure_info['data_start'], mode=mode)
+    result = build_json_structure(item_path, original_data, structure_info, items, mode=mode)
 
     # Save JSON
     with open(json_path, 'w', encoding='utf-8') as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
 
-    print(f"\n✓ Decompiled to {json_path}")
+    print(f"\nDecompiled to {json_path}")
     print(f"Extracted {len(items)} items using {GAME_ENCODING} encoding")
-    print(f"📝 Ready for translation - edit 'name' and 'description' fields in JSON")
+    print(f"Ready for translation - edit 'name' and 'description' fields in JSON")
 
     if test_compilation:
-        test_compilation_process(item_path, json_path, original_data)
+        test_compilation_process(item_path, json_path, original_data, mode)
 
-def compile_item_db(json_path, item_path):
+def compile_item_db(json_path, item_path, cli_mode=None, interactive=False):
     """Compile JSON back to item database file"""
     print(f"=== COMPILING {json_path} ===")
 
     with open(json_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
 
+    mode = resolve_mode(cli_mode, interactive=interactive)
+    print(f"Encoding mode: {mode}")
     print(f"Using encoding: {GAME_ENCODING}")
 
     # Rebuild header exactly as original with dynamic size
@@ -581,11 +646,12 @@ def compile_item_db(json_path, item_path):
         data["structure"],
         data["metadata_sections"],
         data["items"],
-        original_sizes
+        original_sizes,
+        mode=mode,
     )
 
     # Build items data
-    items_data = build_items_data(data["items"], data["structure"]["data_start"])
+    items_data = build_items_data(data["items"], data["structure"]["data_start"], mode=mode)
 
     # Combine all parts
     result_data = header + metadata + items_data
@@ -593,7 +659,7 @@ def compile_item_db(json_path, item_path):
     with open(item_path, 'wb') as f:
         f.write(result_data)
 
-    print(f"✓ Compiled to {item_path}")
+    print(f"Compiled to {item_path}")
     print(f"New size: {len(result_data)} bytes")
     print(f"Original size: {data['file_info']['size']} bytes")
     print(f"Difference: {len(result_data) - data['file_info']['size']:+d} bytes")
@@ -612,14 +678,14 @@ def clean_json_for_user(json_path):
     with open(json_path, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
-def test_compilation_process(item_path, json_path, original_data):
+def test_compilation_process(item_path, json_path, original_data, mode='halfwidth'):
     """Test compilation process"""
     print("\n=== COMPILATION TEST ===")
     test_item_path = item_path.parent / f"{item_path.stem}_test{item_path.suffix}"
 
     try:
         # Test compilation
-        compile_item_db(json_path, test_item_path)
+        compile_item_db(json_path, test_item_path, cli_mode=mode)
 
         with open(test_item_path, 'rb') as f:
             compiled_data = f.read()
@@ -630,15 +696,15 @@ def test_compilation_process(item_path, json_path, original_data):
         print(f"Size difference: {len(compiled_data) - len(original_data):+d} bytes")
 
         if compiled_data == original_data:
-            print("✅ TEST PASSED: Files are identical!")
+            print("TEST PASSED: byte-identical round-trip!")
             test_item_path.unlink()
         else:
-            print("❌ TEST FAILED:")
+            print("TEST FAILED:")
             # Find first difference
             min_len = min(len(original_data), len(compiled_data))
             for i in range(min_len):
                 if original_data[i] != compiled_data[i]:
-                    print(f"  First difference at position {i} (0x{i:x}): {original_data[i]:02x} → {compiled_data[i]:02x}")
+                    print(f"  First difference at position {i} (0x{i:x}): {original_data[i]:02x} -> {compiled_data[i]:02x}")
                     start = max(0, i - 10)
                     end = min(len(original_data), i + 10)
                     print(f"  Context - Original: {original_data[start:end].hex()}")
@@ -647,7 +713,7 @@ def test_compilation_process(item_path, json_path, original_data):
             print(f"  Test file saved: {test_item_path}")
 
     except Exception as e:
-        print(f"❌ Error during testing: {e}")
+        print(f"Error during testing: {e}")
         import traceback
         traceback.print_exc()
 
@@ -665,6 +731,7 @@ def main():
     parser.add_argument("input_file", help="Input file (.item or .json)")
     parser.add_argument("-o", "--output", help="Output file path")
     parser.add_argument("--test", action="store_true", help="Test compilation after decompilation")
+    add_mode_args(parser)
 
     args = parser.parse_args()
     input_path = Path(args.input_file)
@@ -677,14 +744,17 @@ def main():
 
     if file_type == 'json':
         output_path = Path(args.output) if args.output else input_path.with_suffix(ITEM_EXTENSION)
-        compile_item_db(input_path, output_path)
+        compile_item_db(input_path, output_path, cli_mode=args.mode, interactive=is_interactive())
     elif file_type == 'item':
         output_path = Path(args.output) if args.output else input_path.with_suffix(JSON_EXTENSION)
-        decompile_item_db(input_path, output_path, test_compilation=args.test)
+        if args.mode is not None:
+            print("Note: encoding mode is ignored on decompile "
+                  "(the decoder reads halfwidth and 2-byte SJIS transparently).")
+        decompile_item_db(input_path, output_path, test_compilation=args.test, mode='halfwidth')
     else:
         print(f"Unsupported file: {input_path}")
         print(f"Supported: {JSON_EXTENSION} (for compilation) and {ITEM_EXTENSION} (for decompilation)")
         sys.exit(1)
 
 if __name__ == "__main__":
-    main()
+    run_main(main)

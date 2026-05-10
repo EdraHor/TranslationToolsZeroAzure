@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
 Trails from Zero Quest DT Decompiler
-Converts ._dt files to JSON format for easier translation work
-Based on the structure of the @Ivdos program
+Converts ._dt files to JSON format for easier translation work.
+
+Original tool by Ivdos. Adapted for the Trails From Zero Toolkit by Edrahor
+(unified CLI, halfwidth/passthrough modes, drag-and-drop interactive mode,
+file_info-style JSON metadata).
 """
 
 import struct
@@ -11,11 +14,27 @@ import sys
 import argparse
 from pathlib import Path
 
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from byte_codec import (encode_str, decode_str, resolve_mode, add_mode_args,
+                        encode_text_safe, ENCODING_MODES, run_main, is_interactive)
+
 
 class QuestDTDecompiler:
     ENTRY_COUNT = 80
     ENTRY_SIZE = 28  # 1(counter) + 11(reserved) + 4 + 4 + 4 + 4
     ENCODING = 'shift_jis'
+
+    # Encoding mode (set per instance; defaults to halfwidth — see add_mode_args).
+    # halfwidth   : letters -> 1-byte halfwidth (needs patched zero.exe + font.itf)
+    # passthrough : letters -> standard 2-byte SJIS pairs (stock font)
+    # After P1+P2 patches in zero.exe, ALL fields including description/progress
+    # accept halfwidth bytes, so mode applies uniformly to every text field.
+    encoding_mode = 'halfwidth'
     
     # Словарь замен для символов, несовместимых с SJIS
     INCOMPATIBLE_CHARS_REPLACEMENTS = {
@@ -88,8 +107,9 @@ class QuestDTDecompiler:
             return 'у'  # ү -> у
 
         # Кириллические символы
-        if c == '\u0401': return 'Е'  # Ё -> Е
-        if c == '\u0451': return 'е'  # ё -> е
+        # Ё/ё НЕ нормализуем — byte_codec кодирует их в свои 1-байтные коды
+        # if c == '\u0401': return 'Е'   # disabled
+        # if c == '\u0451': return 'е'   # disabled
 
         # Расширенные кириллические символы
         if c == '\u0406': return 'И'  # І -> И
@@ -181,9 +201,9 @@ class QuestDTDecompiler:
         while end < len(data) and data[end] != 0:
             end += 1
 
-        # Decode SJIS string
+        # Decode SJIS string (1-byte letter codes win over 2-byte SJIS pairs)
         try:
-            text = data[ptr:end].decode(self.ENCODING, errors='replace')
+            text = decode_str(bytes(data[ptr:end]), self.ENCODING, self.encoding_mode)
             return text.replace('\u0001', '<LINE>')
         except Exception as e:
             print(f"Warning: SJIS decode error at 0x{ptr:X}: {e}")
@@ -243,42 +263,42 @@ class QuestDTDecompiler:
             }
             entries.append(entry)
 
-        # Step 3: Read progress arrays
+        # Step 3: Read progress arrays.
+        #
+        # Layout note: the original file interleaves per-quest progress STRINGS
+        # with per-quest progress ARRAY (4-byte pointers each). There is no
+        # explicit length field, so we stop reading when the next u32 stops
+        # looking like a valid string pointer.
+        #
+        # Validity rule: a real progress entry pointer must point inside the
+        # file's string area, i.e. [header_size, file_size). Anything outside
+        # (huge values, zero, or pointers into the header range) means we've
+        # walked past the end of THIS quest's array.
+        header_size = self.ENTRY_COUNT * self.ENTRY_SIZE
+
         for i in range(self.ENTRY_COUNT):
             this_ptr = headers[i]['progress_ptr']
             if not this_ptr:
                 entries[i]['progress'] = []
                 continue
 
-            # Calculate size of progress array
-            size_bytes = 0
-            if i < self.ENTRY_COUNT - 1:
-                next_ptr = headers[i + 1]['progress_ptr']
-                if next_ptr > this_ptr and next_ptr <= len(data):
-                    size_bytes = next_ptr - this_ptr
-                else:
-                    # Fallback: read until EOF
-                    size_bytes = len(data) - this_ptr if this_ptr < len(data) else 0
-            else:
-                # Last entry: read until EOF
-                size_bytes = len(data) - this_ptr if this_ptr < len(data) else 0
-
-            # Read progress entries (each is a 4-byte pointer to string)
-            count = max(0, size_bytes // 4)
             progress_list = []
-
-            for j in range(count):
-                try:
-                    ptr_offset = this_ptr + j * 4
-                    if ptr_offset + 4 <= len(data):
-                        text_ptr = struct.unpack('<I', data[ptr_offset:ptr_offset + 4])[0]
-                        text = self.read_cstring_sjis(data, text_ptr)
-                        progress_list.append(text)
-                    else:
-                        break
-                except Exception as e:
-                    print(f"Warning: Error reading progress entry {j} for quest {i}: {e}")
+            j = 0
+            # Hard cap to avoid pathological loops on a corrupted file.
+            HARD_CAP = (len(data) - this_ptr) // 4
+            while j < HARD_CAP:
+                ptr_offset = this_ptr + j * 4
+                if ptr_offset + 4 > len(data):
                     break
+                text_ptr = struct.unpack('<I', data[ptr_offset:ptr_offset + 4])[0]
+
+                # Stop on the first u32 that doesn't look like a valid string ptr.
+                if not (header_size <= text_ptr < len(data)):
+                    break
+
+                text = self.read_cstring_sjis(data, text_ptr)
+                progress_list.append(text)
+                j += 1
 
             entries[i]['progress'] = progress_list
 
@@ -288,7 +308,7 @@ class QuestDTDecompiler:
     def to_json(self, output_path=None, indent=2):
         """Export parsed data to JSON"""
         output = {
-            'metadata': {
+            'file_info': {
                 'format': 'Trails from Zero Quest DT',
                 'encoding': self.ENCODING,
                 'endianness': 'little',
@@ -306,16 +326,33 @@ class QuestDTDecompiler:
         else:
             return json.dumps(output, ensure_ascii=False, indent=indent)
 
-    def from_json(self, json_path):
-        """Load data from JSON for recompilation"""
+    def from_json(self, json_path, cli_mode=None, interactive=False):
+        """Load data from JSON for recompilation.
+
+        Encoding mode is taken from the CLI flag, or from the interactive
+        prompt when the script was launched without arguments. JSON does not
+        carry the mode -- it must be specified explicitly each compile run.
+        """
         with open(json_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
 
+        self.encoding_mode = resolve_mode(cli_mode, interactive=interactive)
         self.entries = data['quests']
         return self.entries
 
-    def encode_sjis_with_null(self, text):
-        """Encode string to SJIS with null terminator"""
+    def encode_sjis_with_null(self, text, use_letter_table=True):
+        """Encode string with null terminator.
+
+        After the P1+P2 binary patches in zero.exe, ALL fields (name, client,
+        description, progress) accept 1-byte halfwidth letters, so the
+        encoding is driven entirely by self.encoding_mode:
+            halfwidth   -> letters become 1-byte halfwidth codes.
+            passthrough -> letters become 2-byte SJIS pairs.
+
+        `use_letter_table` is kept as an explicit override (set False to
+        force 2-byte SJIS even in halfwidth mode), but the compiler itself
+        doesn't use it anywhere -- mode controls everything.
+        """
         if not text:
             return b'\x00'
 
@@ -326,8 +363,10 @@ class QuestDTDecompiler:
             # ВАЖНО: Замена несовместимых символов перед кодированием в SJIS
             text = self.replace_incompatible_chars(text)
 
-            # Кодирование в SJIS
-            encoded = text.encode(self.ENCODING, errors='replace')
+            if use_letter_table and self.encoding_mode == 'halfwidth':
+                encoded = encode_str(text, self.ENCODING, 'halfwidth')
+            else:
+                encoded = encode_text_safe(text, encoding=self.ENCODING)
 
             # Проверка на наличие знаков вопроса (могут появиться при неудачной замене)
             decoded_check = encoded.decode(self.ENCODING, errors='replace')
@@ -361,7 +400,9 @@ class QuestDTDecompiler:
             cursor += len(data)
             return start
 
-        # Allocate strings first
+        # Allocate strings. All fields (name, client, description) follow the
+        # encoding_mode -- halfwidth in halfwidth mode, 2-byte SJIS in passthrough.
+        # P1+P2 patches make the SJIS->UTF-8 description path halfwidth-safe.
         for entry in self.entries:
             entry['_name_ptr'] = allocate(self.encode_sjis_with_null(entry.get('name', '')))
             entry['_client_ptr'] = allocate(self.encode_sjis_with_null(entry.get('client', '')))
@@ -422,6 +463,7 @@ def main():
                        help='Compile JSON back to DT format (default: decompile DT to JSON)')
     parser.add_argument('--indent', type=int, default=2,
                        help='JSON indentation (default: 2)')
+    add_mode_args(parser)
 
     args = parser.parse_args()
 
@@ -441,7 +483,8 @@ def main():
                 output_path = input_path.with_suffix('._dt')
 
             print(f"Compiling JSON to DT: {input_path} -> {output_path}")
-            decompiler.from_json(input_path)
+            decompiler.from_json(input_path, cli_mode=args.mode, interactive=is_interactive())
+            print(f"Encoding mode: {decompiler.encoding_mode}")
             decompiler.compile_to_dt(output_path)
 
         else:
@@ -450,6 +493,10 @@ def main():
             if not output_path:
                 output_path = input_path.with_suffix('.json')
 
+            if args.mode is not None:
+                print("Note: encoding mode is ignored on decompile "
+                      "(the decoder reads halfwidth and 2-byte SJIS transparently).")
+            decompiler.encoding_mode = 'halfwidth'
             print(f"Decompiling DT to JSON: {input_path} -> {output_path}")
             decompiler.parse_dt_file(input_path)
             decompiler.to_json(output_path, indent=args.indent)
@@ -462,10 +509,12 @@ def main():
             non_empty = sum(1 for e in decompiler.entries if e['name'] or e['client'] or e['description'])
             print(f"- Non-empty entries: {non_empty}")
 
+    except SystemExit:
+        raise
     except Exception as e:
         print(f"Error: {e}")
-        sys.exit(1)
+        raise
 
 
 if __name__ == '__main__':
-    main()
+    run_main(main)
